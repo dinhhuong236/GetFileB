@@ -1,26 +1,21 @@
-
-
 <!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>QR Chuẩn - Receiver</title>
-<!-- Tải thư viện quét QR Code siêu tốc -->
+<title>QR Receiver - 4X Speed</title>
 <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
 <style>
     body { font-family: Arial, sans-serif; text-align: center; background: #222; color: white; margin: 0; padding: 15px; }
     button { padding: 12px 20px; margin: 5px; font-size: 16px; cursor: pointer; background: #28a745; color: white; border: none; border-radius: 6px; font-weight: bold; }
     .btn-stop { background: #dc3545; }
     
-    #video-container { position: relative; display: inline-block; margin-top: 10px; width: 100%; max-width: 400px; }
+    #video-container { position: relative; display: inline-block; margin-top: 10px; width: 100%; max-width: 500px; }
     video { width: 100%; height: auto; border: 2px solid #555; border-radius: 8px; background: #000; }
     
-    /* Giao diện quét tinh gọn, không có khung ngắm khắt khe */
-    #scan-overlay {
-        position: absolute; top: 0; left: 0; width: 100%; height: 100%;
-        box-shadow: inset 0 0 0 40px rgba(0,0,0,0.5); pointer-events: none;
-    }
+    /* Đường chữ thập ngắm giữa màn hình */
+    #crosshair::before { content: ""; position: absolute; top: 0; left: 50%; width: 2px; height: 100%; background: rgba(0, 255, 0, 0.4); pointer-events: none; }
+    #crosshair::after { content: ""; position: absolute; top: 50%; left: 0; width: 100%; height: 2px; background: rgba(0, 255, 0, 0.4); pointer-events: none; }
     
     #progress-container { width: 90%; max-width: 400px; background: #444; margin: 15px auto; height: 25px; border-radius: 12px; overflow: hidden; }
     #progress-bar { width: 0%; height: 100%; background: #00ff00; transition: width 0.1s; }
@@ -31,7 +26,7 @@
 </head>
 <body>
 
-<h2>Máy Nhận File (QR Chuẩn)</h2>
+<h2>Máy Nhận - Con Mắt 4 Tiêu Cự</h2>
 <button onclick="startCamera()">Mở Camera</button>
 <button onclick="stopCamera()" class="btn-stop">Tắt Camera</button>
 
@@ -40,12 +35,12 @@
 <div id="progress-container">
     <div id="progress-bar"></div>
 </div>
-<div id="progress-text">0 / 0 mã QR</div>
-<div id="missing-frames">Đưa camera về phía màn hình phát...</div>
+<div id="progress-text">0 / 0 mảnh</div>
+<div id="missing-frames">Giữ đường ngắm xanh lá khớp vào giữa 4 mã QR...</div>
 
-<div id="video-container">
+<div id="video-container" id="crosshair">
     <video id="video" autoplay playsinline></video>
-    <div id="scan-overlay"></div>
+    <div id="crosshair"></div>
 </div>
 
 <canvas id="canvas"></canvas>
@@ -61,6 +56,7 @@ let currentSession = null;
 let receivedChunks = new Set();
 let fileChunks = [];
 let totalFrames = 0;
+let savedFileName = "download_file";
 let isDownloading = false;
 
 function setStatus(msg, color = "#ffcc00") {
@@ -71,20 +67,17 @@ function setStatus(msg, color = "#ffcc00") {
 async function startCamera() {
     try {
         stream = await navigator.mediaDevices.getUserMedia({
-            video: { facingMode: "environment", width: { ideal: 640 }, height: { ideal: 480 } }
+            video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } }
         });
         video.srcObject = stream;
         video.onloadedmetadata = () => {
             video.play();
-            // Thiết lập kích thước canvas bằng video
             canvas.width = video.videoWidth;
             canvas.height = video.videoHeight;
             startScanning();
-            setStatus("Đang quét siêu tốc...", "#00ff00");
+            setStatus("Đang quét 4 góc...", "#00ff00");
         };
-    } catch (err) {
-        setStatus("Lỗi Camera! Hãy mở qua link HTTPS.", "#ff5555");
-    }
+    } catch (err) { setStatus("Lỗi Camera! Hãy mở qua HTTPS.", "#ff5555"); }
 }
 
 function stopCamera() {
@@ -99,23 +92,30 @@ function startScanning() {
     function scanFrame() {
         if (!stream || isDownloading) return;
         
-        // Vẽ video ra canvas để phân tích
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
         
-        // Thư viện jsQR xử lý toàn bộ màn hình (Không cần định vị khung ngắm)
-        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const code = jsQR(imgData.data, imgData.width, imgData.height, {
-            inversionAttempts: "dontInvert", // Tăng tốc độ bằng cách không đảo màu
-        });
+        // Cắt Canvas ra làm 4 góc để đọc 4 mã
+        const halfW = Math.floor(canvas.width / 2);
+        const halfH = Math.floor(canvas.height / 2);
+        
+        const regions = [
+            { x: 0, y: 0, w: halfW, h: halfH },           // Trái trên
+            { x: halfW, y: 0, w: halfW, h: halfH },       // Phải trên
+            { x: 0, y: halfH, w: halfW, h: halfH },       // Trái dưới
+            { x: halfW, y: halfH, w: halfW, h: halfH }    // Phải dưới
+        ];
 
-        if (code) {
-            try {
-                const payload = JSON.parse(code.data);
-                handleValidPayload(payload);
-            } catch(e) {
-                // QR hợp lệ nhưng nội dung JSON hỏng (hiếm khi xảy ra với mã QR chuẩn)
+        regions.forEach(r => {
+            const imgData = ctx.getImageData(r.x, r.y, r.w, r.h);
+            const code = jsQR(imgData.data, imgData.width, imgData.height, { inversionAttempts: "dontInvert" });
+            
+            if (code) {
+                try {
+                    const payload = JSON.parse(code.data);
+                    handleValidPayload(payload);
+                } catch(e) {}
             }
-        }
+        });
 
         scanInterval = requestAnimationFrame(scanFrame);
     }
@@ -129,19 +129,21 @@ function handleValidPayload(payload) {
         receivedChunks = new Set();
         fileChunks = new Array(totalFrames);
     }
+    
+    // Lưu lại tên file nếu gói tin này có chứa tên
+    if (payload.n) savedFileName = payload.n;
 
     if (!receivedChunks.has(payload.s)) {
         receivedChunks.add(payload.s);
         fileChunks[payload.s] = payload.d; 
         
-        // Cập nhật Giao diện
         const percent = (receivedChunks.size / totalFrames) * 100;
         document.getElementById("progress-bar").style.width = percent + "%";
-        document.getElementById("progress-text").innerText = `${receivedChunks.size} / ${totalFrames} mã QR`;
+        document.getElementById("progress-text").innerText = `${receivedChunks.size} / ${totalFrames} mảnh`;
 
         let missingCount = totalFrames - receivedChunks.size;
         if (missingCount > 0) {
-            document.getElementById("missing-frames").innerText = `Đang tải... Còn thiếu ${missingCount} mảnh dữ liệu`;
+            document.getElementById("missing-frames").innerText = `Đang tải... Cần bắt ${missingCount} mảnh nữa.`;
             document.getElementById("missing-frames").style.color = "#ffcc00";
         } else {
             document.getElementById("missing-frames").innerText = "Đã thu thập đủ 100%!";
@@ -150,16 +152,15 @@ function handleValidPayload(payload) {
 
         if (receivedChunks.size === totalFrames) {
             isDownloading = true; 
-            setStatus("Đang lưu file vào máy...", "#00ff00");
-            assembleAndDownload(payload.n);
+            setStatus("Đang ráp và lưu file...", "#00ff00");
+            assembleAndDownload();
         }
     }
 }
 
-function assembleAndDownload(fileName) {
+function assembleAndDownload() {
     try {
         const fullBase64 = fileChunks.join("");
-        
         const binaryString = atob(fullBase64);
         const bytes = new Uint8Array(binaryString.length);
         for (let i = 0; i < binaryString.length; i++) {
@@ -171,7 +172,7 @@ function assembleAndDownload(fileName) {
         
         const a = document.createElement("a");
         a.href = url;
-        a.download = fileName;
+        a.download = savedFileName;
         document.body.appendChild(a);
         a.click();
         
@@ -179,7 +180,7 @@ function assembleAndDownload(fileName) {
         URL.revokeObjectURL(url);
         
         fileChunks = []; 
-        setStatus("✅ Đã tải xong: " + fileName, "#00ff00");
+        setStatus("✅ Đã tải xong: " + savedFileName, "#00ff00");
         setTimeout(() => alert("Tải file thành công!"), 500);
         
     } catch (err) {
