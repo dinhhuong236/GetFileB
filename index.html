@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QR Receiver 64x64</title>
+<style>
+    body {
+        font-family: Arial, sans-serif;
+        text-align: center;
+        background: #222;
+        color: white;
+        margin: 0;
+        padding: 15px;
+    }
+    h2 { margin-top: 5px; font-size: 22px; }
+    button {
+        padding: 12px 20px;
+        margin: 5px;
+        font-size: 16px;
+        cursor: pointer;
+        background: #28a745;
+        color: white;
+        border: none;
+        border-radius: 6px;
+        font-weight: bold;
+    }
+    button:hover { background: #218838; }
+    .btn-stop { background: #dc3545; }
+    .btn-stop:hover { background: #c82333; }
+    
+    #video-container {
+        position: relative;
+        display: inline-block;
+        margin-top: 15px;
+        width: 100%;
+        max-width: 500px;
+    }
+    video {
+        background: #000;
+        width: 100%;
+        height: auto;
+        border: 2px solid #555;
+        border-radius: 8px;
+    }
+    /* Khung ngắm màu xanh lá */
+    #target-box {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        width: 250px; 
+        height: 250px;
+        transform: translate(-50%, -50%);
+        border: 3px solid #00ff00;
+        box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.6);
+        pointer-events: none;
+    }
+    #target-box::after {
+        content: 'Căn màn hình chớp VỪA KHÍT khung này';
+        position: absolute;
+        top: -25px;
+        left: 0;
+        width: 100%;
+        text-align: center;
+        color: #00ff00;
+        font-weight: bold;
+        font-size: 12px;
+        white-space: nowrap;
+    }
+    #progress-container {
+        width: 90%;
+        max-width: 400px;
+        background: #444;
+        margin: 10px auto;
+        height: 20px;
+        border-radius: 10px;
+        overflow: hidden;
+    }
+    #progress-bar {
+        width: 0%;
+        height: 100%;
+        background: #00ff00;
+        transition: width 0.1s;
+    }
+    #progress-text { margin-top: 5px; font-weight: bold; font-size: 15px; }
+    #missing-frames { color: #ffcc00; font-size: 13px; margin-top: 5px; min-height: 20px; }
+    canvas { display: none; }
+</style>
+</head>
+<body>
+
+<h2>Máy Nhận Dữ Liệu</h2>
+<button onclick="startCamera()">Mở Camera</button>
+<button onclick="stopCamera()" class="btn-stop">Tắt Camera</button>
+
+<h3 id="status" style="color: #ffcc00; margin-bottom: 5px;">Đang chờ camera...</h3>
+
+<div id="progress-container">
+    <div id="progress-bar"></div>
+</div>
+<div id="progress-text">0 / 0 frames</div>
+<div id="missing-frames"></div>
+
+<div id="video-container">
+    <video id="video" autoplay playsinline></video>
+    <div id="target-box"></div>
+</div>
+
+<canvas id="canvas"></canvas>
+
+<script>
+const GRID_SIZE = 64;
+let video = document.getElementById("video");
+let canvas = document.getElementById("canvas");
+let ctx = canvas.getContext("2d", { willReadFrequently: true });
+let scanInterval = null;
+let stream = null;
+
+let currentSession = null;
+let receivedChunks = new Set();
+let fileChunks = [];
+let totalFrames = 0;
+let isDownloading = false;
+
+function setStatus(msg, color = "#ffcc00") {
+    const el = document.getElementById("status");
+    el.innerText = msg;
+    el.style.color = color;
+}
+
+async function startCamera() {
+    try {
+        // Ưu tiên camera sau trên Android
+        stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } }
+        });
+        video.srcObject = stream;
+        
+        video.onloadedmetadata = () => {
+            video.play();
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            startScanning();
+            setStatus("Đang quét... Hãy giữ chắc tay!", "#00ff00");
+        };
+    } catch (err) {
+        setStatus("Lỗi quyền Camera (Hoặc không có HTTPS)", "#ff5555");
+    }
+}
+
+function stopCamera() {
+    if (stream) stream.getTracks().forEach(track => track.stop());
+    if (scanInterval) cancelAnimationFrame(scanInterval);
+    setStatus("Đã tắt camera.", "#fff");
+}
+
+function startScanning() {
+    isDownloading = false;
+    
+    function scanFrame() {
+        if (!stream || isDownloading) return;
+        
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        
+        const rect = video.getBoundingClientRect();
+        const scaleX = canvas.width / rect.width;
+        const scaleY = canvas.height / rect.height;
+        // Khung xanh lá của mình kích thước 250x250 px
+        const boxSize = 250; 
+        
+        const sx = ((rect.width - boxSize) / 2) * scaleX;
+        const sy = ((rect.height - boxSize) / 2) * scaleY;
+        const sWidth = boxSize * scaleX;
+        const sHeight = boxSize * scaleY;
+
+        try {
+            const imgData = ctx.getImageData(sx, sy, sWidth, sHeight);
+            processImageData(imgData);
+        } catch(e) {}
+
+        scanInterval = requestAnimationFrame(scanFrame);
+    }
+    scanFrame();
+}
+
+function processImageData(imgData) {
+    const data = imgData.data;
+    const cellW = imgData.width / GRID_SIZE;
+    const cellH = imgData.height / GRID_SIZE;
+    let bits = [];
+
+    // Lấy màu ở chính giữa từng ô vuông
+    for (let y = 0; y < GRID_SIZE; y++) {
+        for (let x = 0; x < GRID_SIZE; x++) {
+            const px = Math.floor(x * cellW + cellW / 2);
+            const py = Math.floor(y * cellH + cellH / 2);
+            const i = (py * imgData.width + px) * 4;
+            
+            const brightness = (data[i] + data[i+1] + data[i+2]) / 3;
+            bits.push(brightness < 128 ? 1 : 0);
+        }
+    }
+
+    let bytes = [];
+    for (let i = 0; i < bits.length; i += 8) {
+        let byte = 0;
+        for (let b = 0; b < 8; b++) {
+            if (bits[i + b]) byte |= (1 << (7 - b));
+        }
+        if (byte === 0) break; // Cắt phần viền trắng thừa
+        bytes.push(byte);
+    }
+
+    try {
+        const text = new TextDecoder("utf-8").decode(new Uint8Array(bytes));
+        const payload = JSON.parse(text); 
+        handleValidPayload(payload);
+    } catch (e) {
+        // Sai số do khung hình mờ -> bỏ qua, chờ frame tiếp
+    }
+}
+
+function handleValidPayload(payload) {
+    if (currentSession !== payload.i) {
+        currentSession = payload.i;
+        totalFrames = payload.t;
+        receivedChunks = new Set();
+        fileChunks = new Array(totalFrames);
+    }
+
+    if (!receivedChunks.has(payload.s)) {
+        receivedChunks.add(payload.s);
+        fileChunks[payload.s] = payload.d; 
+        
+        const percent = (receivedChunks.size / totalFrames) * 100;
+        document.getElementById("progress-bar").style.width = percent + "%";
+        document.getElementById("progress-text").innerText = `${receivedChunks.size} / ${totalFrames} frames`;
+
+        let missingCount = totalFrames - receivedChunks.size;
+        
+        if (missingCount > 0) {
+            document.getElementById("missing-frames").innerText = `Còn thiếu ${missingCount} frames... (Cứ giữ yên camera)`;
+        } else {
+            document.getElementById("missing-frames").innerText = "Đã thu thập đủ 100%!";
+        }
+
+        if (receivedChunks.size === totalFrames) {
+            isDownloading = true; 
+            setStatus("Đang xử lý và lưu file về máy...", "#00ff00");
+            assembleAndDownload(payload.n);
+        }
+    }
+}
+
+function assembleAndDownload(fileName) {
+    try {
+        // Nối mảng thành chuỗi Base64
+        const fullBase64 = fileChunks.join("");
+        
+        // Chuyển Base64 thành file Binary
+        const binaryString = atob(fullBase64);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+            bytes[i] = binaryString.charCodeAt(i);
+        }
+        
+        // Tạo Blob file
+        const blob = new Blob([bytes]);
+        const url = URL.createObjectURL(blob);
+        
+        // Tạo lệnh tải xuống trực tiếp thiết bị
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        
+        // Xóa link và giải phóng RAM để tránh nặng máy
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        
+        // Reset để chuẩn bị quét file tiếp theo
+        fileChunks = []; 
+        setStatus("✅ Đã lưu file: " + fileName, "#00ff00");
+        
+    } catch (err) {
+        setStatus("❌ Lỗi giải mã file (File có thể bị hỏng)!", "#ff5555");
+    }
+}
+</script>
+</body>
+</html>
