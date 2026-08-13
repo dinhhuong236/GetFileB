@@ -1,285 +1,109 @@
+
+
 <!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>QR Receiver 64x64 (Markers)</title>
+<title>QR Chuẩn - Sender</title>
+<!-- Tải thư viện tạo QR Code -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <style>
-    body {
-        font-family: Arial, sans-serif; text-align: center;
-        background: #222; color: white; margin: 0; padding: 15px;
+    body { font-family: Arial, sans-serif; text-align: center; background: #f3f3f3; margin: 20px; }
+    button { padding: 10px 20px; margin: 5px; cursor: pointer; font-size: 16px; background: #007bff; color: white; border: none; border-radius: 4px; }
+    #status { margin-top: 10px; font-size: 18px; font-weight: bold; color: #333; }
+    /* Căn giữa mã QR */
+    #qrcode-container {
+        display: flex; justify-content: center; align-items: center;
+        margin-top: 20px;
     }
-    h2 { margin-top: 5px; font-size: 22px; }
-    button {
-        padding: 12px 20px; margin: 5px; font-size: 16px;
-        cursor: pointer; background: #28a745; color: white;
-        border: none; border-radius: 6px; font-weight: bold;
-    }
-    .btn-stop { background: #dc3545; }
-    
-    #video-container {
-        position: relative; display: inline-block;
-        margin-top: 10px; width: 100%; max-width: 500px;
-    }
-    video {
-        background: #000; width: 100%; height: auto;
-        border: 2px solid #555; border-radius: 8px;
-    }
-    
-    /* Khung ngắm chính */
-    #target-box {
-        position: absolute; top: 50%; left: 50%;
-        width: 260px; height: 260px;
-        transform: translate(-50%, -50%);
-        border: 2px solid rgba(0, 255, 0, 0.8);
-        box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.6);
-        pointer-events: none;
-    }
-    
-    /* 3 Ô vuống hướng dẫn căn góc */
-    .corner-guide {
-        position: absolute; width: 32px; height: 32px;
-        border: 3px solid #00ff00; background: rgba(0, 255, 0, 0.2);
-    }
-    .top-left { top: -2px; left: -2px; }
-    .top-right { top: -2px; right: -2px; }
-    .bottom-left { bottom: -2px; left: -2px; }
-
-    #target-box::after {
-        content: 'KHỚP 3 Ô VUÔNG VÀO 3 GÓC NÀY';
-        position: absolute; top: -28px; left: 0; width: 100%;
-        text-align: center; color: #00ff00; font-weight: bold; font-size: 13px;
-    }
-
-    #progress-container {
-        width: 90%; max-width: 400px; background: #444;
-        margin: 10px auto; height: 22px; border-radius: 10px; overflow: hidden;
-    }
-    #progress-bar { width: 0%; height: 100%; background: #00ff00; transition: width 0.1s; }
-    #progress-text { font-weight: bold; font-size: 15px; }
-    #missing-frames { color: #ffcc00; font-size: 14px; margin-top: 8px; min-height: 40px; font-weight: bold; }
-    canvas { display: none; }
+    #qrcode { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
 </style>
 </head>
 <body>
 
-<h2>Máy Nhận Dữ Liệu</h2>
-<button onclick="startCamera()">Mở Camera</button>
-<button onclick="stopCamera()" class="btn-stop">Tắt Camera</button>
+<h2>Máy Phát File qua QR Code Chuẩn</h2>
+<input type="file" id="fileInput"><br><br>
+<button onclick="prepare()">1. Chuẩn bị</button>
+<button onclick="start()">2. Phát</button>
+<button onclick="stop()">3. Dừng</button>
+<div id="status">Vui lòng chọn file...</div>
 
-<h3 id="status" style="color: #ffcc00; margin-bottom: 5px;">Đang chờ camera...</h3>
-
-<div id="progress-container">
-    <div id="progress-bar"></div>
+<div id="qrcode-container">
+    <div id="qrcode"></div>
 </div>
-<div id="progress-text">0 / 0 frames</div>
-<div id="missing-frames">Chưa bắt được tín hiệu...</div>
-
-<div id="video-container">
-    <video id="video" autoplay playsinline></video>
-    <div id="target-box">
-        <!-- 3 ô vuông mờ để người dùng dễ ngắm -->
-        <div class="corner-guide top-left"></div>
-        <div class="corner-guide top-right"></div>
-        <div class="corner-guide bottom-left"></div>
-    </div>
-</div>
-
-<canvas id="canvas"></canvas>
 
 <script>
-const GRID_SIZE = 64;
-let video = document.getElementById("video");
-let canvas = document.getElementById("canvas");
-let ctx = canvas.getContext("2d", { willReadFrequently: true });
-let scanInterval = null;
-let stream = null;
+// Giảm dung lượng mỗi mảnh xuống để mã QR không bị quá đặc (quá đặc sẽ khó quét)
+const CHUNK_SIZE = 250; 
+const FRAME_RATE = 5; // Tốc độ 5 khung hình/giây
 
-let currentSession = null;
-let receivedChunks = new Set();
-let fileChunks = [];
-let totalFrames = 0;
-let isDownloading = false;
-let errorCount = 0;
+let packets = [];
+let frameIndex = 0;
+let loopCount = 1;
+let timer = null;
+let qrCodeObj = null;
 
-function setStatus(msg, color = "#ffcc00") {
-    document.getElementById("status").innerText = msg;
-    document.getElementById("status").style.color = color;
+function setStatus(msg) { document.getElementById("status").innerText = msg; }
+function randomSession() { return Math.random().toString(36).substring(2, 10); }
+
+function readFileAsBase64(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result.split(',')[1]);
+        reader.onerror = error => reject(error);
+        reader.readAsDataURL(file);
+    });
 }
 
-async function startCamera() {
-    try {
-        stream = await navigator.mediaDevices.getUserMedia({
-            video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } }
-        });
-        video.srcObject = stream;
-        video.onloadedmetadata = () => {
-            video.play();
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
-            startScanning();
-            setStatus("Hãy khớp 3 ô vuông vào 3 góc xanh!", "#00ff00");
-        };
-    } catch (err) {
-        setStatus("Lỗi Camera! Hãy mở qua HTTPS.", "#ff5555");
-    }
-}
-
-function stopCamera() {
-    if (stream) stream.getTracks().forEach(track => track.stop());
-    if (scanInterval) cancelAnimationFrame(scanInterval);
-    setStatus("Đã tắt camera.", "#fff");
-}
-
-function startScanning() {
-    isDownloading = false;
-    errorCount = 0;
-    
-    function scanFrame() {
-        if (!stream || isDownloading) return;
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        
-        const rect = video.getBoundingClientRect();
-        const scaleX = canvas.width / rect.width;
-        const scaleY = canvas.height / rect.height;
-        const boxSize = 260; // Kích thước khung ngắm
-        
-        const sx = ((rect.width - boxSize) / 2) * scaleX;
-        const sy = ((rect.height - boxSize) / 2) * scaleY;
-        const sWidth = boxSize * scaleX;
-        const sHeight = boxSize * scaleY;
-
-        try {
-            const imgData = ctx.getImageData(sx, sy, sWidth, sHeight);
-            processImageData(imgData);
-        } catch(e) {}
-
-        scanInterval = requestAnimationFrame(scanFrame);
-    }
-    scanFrame();
-}
-
-// Hàm xác định vùng 3 góc (Giống hệt bên Sender)
-function isMarkerArea(x, y) {
-    if (x < 8 && y < 8) return true;
-    if (x > 55 && y < 8) return true;
-    if (x < 8 && y > 55) return true;
-    return false;
-}
-
-function processImageData(imgData) {
-    const data = imgData.data;
-    const cellW = imgData.width / GRID_SIZE;
-    const cellH = imgData.height / GRID_SIZE;
-    let bits = [];
-
-    // Quét lấy điểm ảnh (BỎ QUA 3 GÓC)
-    for (let y = 0; y < GRID_SIZE; y++) {
-        for (let x = 0; x < GRID_SIZE; x++) {
-            
-            // Nếu là khu vực của 3 ô vuông định vị -> Bỏ qua, không lấy dữ liệu
-            if (isMarkerArea(x, y)) continue;
-
-            const px = Math.floor(x * cellW + cellW / 2);
-            const py = Math.floor(y * cellH + cellH / 2);
-            const i = (py * imgData.width + px) * 4;
-            
-            const brightness = (data[i] + data[i+1] + data[i+2]) / 3;
-            bits.push(brightness < 128 ? 1 : 0);
-        }
-    }
-
-    // Ghép bit thành byte
-    let bytes = [];
-    for (let i = 0; i < bits.length; i += 8) {
-        let byte = 0;
-        for (let b = 0; b < 8; b++) {
-            if (bits[i + b]) byte |= (1 << (7 - b));
-        }
-        if (byte === 0) break; // Cắt viền padding
-        bytes.push(byte);
-    }
+async function prepare() {
+    const file = document.getElementById("fileInput").files[0];
+    if (!file) return alert("Vui lòng chọn file!");
+    stop();
+    setStatus("Đang đóng gói dữ liệu...");
 
     try {
-        const text = new TextDecoder("utf-8").decode(new Uint8Array(bytes));
-        const payload = JSON.parse(text); 
-        
-        // --- QUÉT THÀNH CÔNG ---
-        errorCount = 0; 
-        document.getElementById("missing-frames").style.color = "#ffcc00";
-        handleValidPayload(payload);
+        const base64 = await readFileAsBase64(file);
+        const sid = randomSession();
+        packets = [];
+        const total = Math.ceil(base64.length / CHUNK_SIZE);
 
-    } catch (e) {
-        // --- QUÉT LỖI ---
-        errorCount++;
-        if (errorCount > 10 && !isDownloading) {
-            document.getElementById("missing-frames").innerText = "⚠️ Lệch góc!\nHãy khớp chính xác 3 ô nhấp nháy vào 3 góc xanh lá!";
-            document.getElementById("missing-frames").style.color = "#ff5555";
+        for (let i = 0; i < total; i++) {
+            packets.push(JSON.stringify({
+                i: sid, s: i, t: total, n: file.name, z: file.size,
+                d: base64.substring(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE)
+            }));
         }
-    }
+
+        setStatus(`Chuẩn bị xong! Tổng: ${packets.length} mã QR.`);
+        frameIndex = 0; loopCount = 1;
+
+        // Khởi tạo bộ vẽ QR
+        if (!qrCodeObj) {
+            qrCodeObj = new QRCode(document.getElementById("qrcode"), {
+                width: 400,
+                height: 400,
+                correctLevel: QRCode.CorrectLevel.L // Mức sửa lỗi thấp để QR thưa, dễ quét
+            });
+        }
+        qrCodeObj.makeCode(packets[0]);
+
+    } catch (err) { setStatus("Lỗi đọc file!"); }
 }
 
-function handleValidPayload(payload) {
-    if (currentSession !== payload.i) {
-        currentSession = payload.i;
-        totalFrames = payload.t;
-        receivedChunks = new Set();
-        fileChunks = new Array(totalFrames);
-    }
-
-    if (!receivedChunks.has(payload.s)) {
-        receivedChunks.add(payload.s);
-        fileChunks[payload.s] = payload.d; 
+function start() {
+    if (packets.length === 0) return alert("Vui lòng Chuẩn bị trước!");
+    stop();
+    timer = setInterval(() => {
+        qrCodeObj.makeCode(packets[frameIndex]);
+        setStatus(`Đang phát (Vòng ${loopCount}): ${frameIndex + 1} / ${packets.length} QR`);
         
-        const percent = (receivedChunks.size / totalFrames) * 100;
-        document.getElementById("progress-bar").style.width = percent + "%";
-        document.getElementById("progress-text").innerText = `${receivedChunks.size} / ${totalFrames} frames`;
-
-        let missingCount = totalFrames - receivedChunks.size;
-        if (missingCount > 0) {
-            document.getElementById("missing-frames").innerText = `Đang tải... Còn thiếu ${missingCount} frames`;
-        } else {
-            document.getElementById("missing-frames").innerText = "Đã thu thập đủ 100%!";
-            document.getElementById("missing-frames").style.color = "#00ff00";
-        }
-
-        if (receivedChunks.size === totalFrames) {
-            isDownloading = true; 
-            setStatus("Đang lưu file vào máy...", "#00ff00");
-            assembleAndDownload(payload.n);
-        }
-    }
+        frameIndex++;
+        if (frameIndex >= packets.length) { frameIndex = 0; loopCount++; }
+    }, 1000 / FRAME_RATE);
 }
 
-function assembleAndDownload(fileName) {
-    try {
-        const fullBase64 = fileChunks.join("");
-        
-        const binaryString = atob(fullBase64);
-        const bytes = new Uint8Array(binaryString.length);
-        for (let i = 0; i < binaryString.length; i++) {
-            bytes[i] = binaryString.charCodeAt(i);
-        }
-        
-        const blob = new Blob([bytes]);
-        const url = URL.createObjectURL(blob);
-        
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = fileName;
-        document.body.appendChild(a);
-        a.click();
-        
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-        
-        fileChunks = []; 
-        setStatus("✅ Đã tải xong: " + fileName, "#00ff00");
-        setTimeout(() => alert("Tải file thành công!"), 500);
-        
-    } catch (err) {
-        setStatus("❌ Lỗi giải mã file!", "#ff5555");
-    }
+function stop() { 
+    if (timer) { clearInterval(timer); timer = null; setStatus("Đã tạm dừng."); } 
 }
 </script>
 </body>
