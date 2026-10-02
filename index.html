@@ -1,5 +1,3 @@
-
-
 <!DOCTYPE html>
 <html lang="vi">
 <head>
@@ -16,16 +14,18 @@
     #video-container { position: relative; display: inline-block; margin-top: 10px; width: 100%; max-width: 400px; }
     video { width: 100%; height: auto; border: 2px solid #555; border-radius: 8px; background: #000; }
     
-    /* Giao diện quét tinh gọn, không có khung ngắm khắt khe */
     #scan-overlay {
         position: absolute; top: 0; left: 0; width: 100%; height: 100%;
         box-shadow: inset 0 0 0 40px rgba(0,0,0,0.5); pointer-events: none;
     }
     
-    #progress-container { width: 90%; max-width: 400px; background: #444; margin: 15px auto; height: 25px; border-radius: 12px; overflow: hidden; }
-    #progress-bar { width: 0%; height: 100%; background: #00ff00; transition: width 0.1s; }
-    #progress-text { font-weight: bold; font-size: 15px; }
-    #missing-frames { color: #ffcc00; font-size: 14px; margin-top: 8px; font-weight: bold; min-height: 20px;}
+    #progress-container { width: 90%; max-width: 400px; background: #444; margin: 15px auto; height: 25px; border-radius: 12px; overflow: hidden; border: 1px solid #666; }
+    
+    /* Progress bar giờ chiếm 100% chiều dài, ta sẽ dùng JS để tô màu background (Xanh/Đỏ/Xám) */
+    #progress-bar { width: 100%; height: 100%; background: #444; }
+    
+    #progress-text { font-weight: bold; font-size: 15px; margin-top: 5px;}
+    #missing-frames { color: #ffcc00; font-size: 14px; margin-top: 8px; font-weight: bold; min-height: 20px; word-wrap: break-word; padding: 0 10px;}
     canvas { display: none; }
 </style>
 </head>
@@ -62,6 +62,7 @@ let receivedChunks = new Set();
 let fileChunks = [];
 let totalFrames = 0;
 let isDownloading = false;
+let maxIndexReceived = -1; // Biến mới để biết ta đã quét tới frame xa nhất là bao nhiêu
 
 function setStatus(msg, color = "#ffcc00") {
     document.getElementById("status").innerText = msg;
@@ -76,7 +77,6 @@ async function startCamera() {
         video.srcObject = stream;
         video.onloadedmetadata = () => {
             video.play();
-            // Thiết lập kích thước canvas bằng video
             canvas.width = video.videoWidth;
             canvas.height = video.videoHeight;
             startScanning();
@@ -99,22 +99,18 @@ function startScanning() {
     function scanFrame() {
         if (!stream || isDownloading) return;
         
-        // Vẽ video ra canvas để phân tích
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
         
-        // Thư viện jsQR xử lý toàn bộ màn hình (Không cần định vị khung ngắm)
         const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
         const code = jsQR(imgData.data, imgData.width, imgData.height, {
-            inversionAttempts: "dontInvert", // Tăng tốc độ bằng cách không đảo màu
+            inversionAttempts: "dontInvert", 
         });
 
         if (code) {
             try {
                 const payload = JSON.parse(code.data);
                 handleValidPayload(payload);
-            } catch(e) {
-                // QR hợp lệ nhưng nội dung JSON hỏng (hiếm khi xảy ra với mã QR chuẩn)
-            }
+            } catch(e) { }
         }
 
         scanInterval = requestAnimationFrame(scanFrame);
@@ -128,24 +124,67 @@ function handleValidPayload(payload) {
         totalFrames = payload.t;
         receivedChunks = new Set();
         fileChunks = new Array(totalFrames);
+        maxIndexReceived = -1; // Đặt lại vị trí xa nhất mỗi khi quét file mới
     }
 
     if (!receivedChunks.has(payload.s)) {
         receivedChunks.add(payload.s);
         fileChunks[payload.s] = payload.d; 
         
-        // Cập nhật Giao diện
-        const percent = (receivedChunks.size / totalFrames) * 100;
-        document.getElementById("progress-bar").style.width = percent + "%";
+        // Cập nhật vị trí mã xa nhất đã nhận được để biết mã nào bị bỏ sót
+        if (payload.s > maxIndexReceived) {
+            maxIndexReceived = payload.s;
+        }
+
+        // --- CẬP NHẬT BẢN ĐỒ MÀU CHO THANH PROGRESS BAR ---
+        let gradientStops = [];
+        let step = 100 / totalFrames;
+        let lastColor = null;
+        let startPct = 0;
+
+        for (let i = 0; i <= totalFrames; i++) {
+            let color = "#444"; // Mặc định: Chưa quét tới (màu như cũ)
+            if (i < totalFrames) {
+                if (receivedChunks.has(i)) {
+                    color = "#00ff00"; // Thành công (Màu xanh lá)
+                } else if (i < maxIndexReceived) {
+                    color = "#ff3333"; // Đã vượt qua nhưng không nhận được -> Bỏ sót (Màu đỏ)
+                }
+            } else {
+                color = null; // Kết thúc vòng lặp
+            }
+
+            // Tối ưu css bằng cách gộp các dải màu giống nhau nằm liền kề
+            if (color !== lastColor) {
+                if (lastColor !== null) {
+                    let endStr = (i * step).toFixed(2);
+                    let startStr = startPct.toFixed(2);
+                    gradientStops.push(`${lastColor} ${startStr}% ${endStr}%`);
+                    startPct = i * step;
+                }
+                lastColor = color;
+            }
+        }
+        
+        // Cập nhật giao diện thanh bar
+        document.getElementById("progress-bar").style.background = `linear-gradient(to right, ${gradientStops.join(", ")})`;
         document.getElementById("progress-text").innerText = `${receivedChunks.size} / ${totalFrames} mã QR`;
 
+        // Tính số mã bị thiếu hiển thị dưới dạng văn bản (để phụ trợ thêm nếu cần)
         let missingCount = totalFrames - receivedChunks.size;
         if (missingCount > 0) {
-            document.getElementById("missing-frames").innerText = `Đang tải... Còn thiếu ${missingCount} mảnh dữ liệu`;
-            document.getElementById("missing-frames").style.color = "#ffcc00";
+            let missingList = [];
+            for (let i = 0; i < totalFrames; i++) {
+                if (!receivedChunks.has(i)) missingList.push(i + 1); 
+            }
+            let displayMissing = missingList.slice(0, 15).join(", ");
+            if (missingList.length > 15) displayMissing += `... (+${missingList.length - 15} mã nữa)`;
+
+            document.getElementById("missing-frames").innerText = `Còn thiếu ${missingCount} mã số: [${displayMissing}]`;
+            document.getElementById("missing-frames").style.color = "#ff3333"; 
         } else {
             document.getElementById("missing-frames").innerText = "Đã thu thập đủ 100%!";
-            document.getElementById("missing-frames").style.color = "#00ff00";
+            document.getElementById("missing-frames").style.color = "#00ff00"; 
         }
 
         if (receivedChunks.size === totalFrames) {
