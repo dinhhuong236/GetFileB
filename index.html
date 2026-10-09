@@ -12,11 +12,13 @@
     .btn-stop { background: #dc3545; }
     .btn-gray { background: #666; }
 
-    #video-container { position: relative; display: inline-block; margin-top: 10px; width: 100%; max-width: 400px; border: 2px solid #555; border-radius: 8px; overflow: hidden; line-height: 0; background: #000; }
-    video { width: 100%; height: auto; display: block; }
+    #video-container { position: relative; display: inline-block; margin-top: 10px; width: 100%; max-width: 400px; }
+    video { width: 100%; height: auto; border: 2px solid #555; border-radius: 8px; background: #000; }
 
-    #roi-box { position: absolute; border: 2px solid #00ff00; box-shadow: 0 0 0 9999px rgba(0,0,0,0.45); pointer-events: none; display: none; }
-    #track-box { position: absolute; border: 2px dashed #ffcc00; pointer-events: none; display: none; }
+    #scan-overlay {
+        position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+        box-shadow: inset 0 0 0 40px rgba(0,0,0,0.5); pointer-events: none;
+    }
 
     #progress-container { width: 90%; max-width: 400px; background: #444; margin: 15px auto; height: 25px; border-radius: 12px; overflow: hidden; border: 1px solid #666; }
     #progress-bar { width: 100%; height: 100%; background: #444; }
@@ -49,75 +51,36 @@
 
 <div id="video-container">
     <video id="video" autoplay playsinline muted></video>
-    <div id="roi-box"></div>
-    <div id="track-box"></div>
+    <div id="scan-overlay"></div>
 </div>
 
 <script>
 // ======================= CẤU HÌNH =======================
 const CONFIG = {
-    camWidth: 1280,
-    camHeight: 720,
-    camFps: 60,
-    roi: 0.8,                // vùng tìm kiếm hình vuông ở giữa = 80% cạnh ngắn
-    searchMaxSize: 640,      // khi chưa tìm thấy mã: vùng tìm kiếm tối đa chừng này pixel
-
-    // --- Bám theo vị trí mã QR: giảm kích thước mỗi frame lưu vào bộ đệm ---
-    trackMargin: 0.25,       // nới rộng khung bám thêm 25% mỗi phía (an toàn khi tay hơi rung)
-    targetModulePx: 4,       // thu nhỏ sao cho mỗi ô của QR còn ~4px
-    trackMaxFails: 8,        // giải mã trượt liên tiếp chừng này frame bám thì quay lại tìm toàn vùng
-
-    // --- Chống trùng ---
-    thumbSize: 64,
-    dupThreshold: 6,         // chênh lệch trung bình (0-255) dưới mức này = cùng một mã QR
-    purgeWindow: 60,         // khi đọc được 1 mã, dọn các frame trùng mã đó trong 60 frame kế tiếp của bộ đệm
-
-    // --- Bộ đệm ---
+    camWidth: 640,           // giữ như code gốc; có thể thử 1280x720 nếu QR rất dày
+    camHeight: 480,
+    camFps: 30,              // có thể thử 60 nếu máy hỗ trợ
     maxBufferMB: 256,        // giới hạn bộ nhớ cho bộ đệm; đầy thì tạm dừng ghi tới khi còn 50%
-
     workers: Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 2) - 1)),
     nativeConcurrency: 2,
-    useNative: true
+    useNative: true          // false = luôn dùng jsQR (để so sánh chất lượng nhận dạng)
 };
 const JSQR_URL = "https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js";
-const JSQR_OPTS = { inversionAttempts: "dontInvert" };
-
-// Chuyển kết quả jsQR thành { text, box, version }
-function jsqrResult(code) {
-    if (!code) return { text: null };
-    const L = code.location;
-    const xs = [L.topLeftCorner.x, L.topRightCorner.x, L.bottomLeftCorner.x, L.bottomRightCorner.x];
-    const ys = [L.topLeftCorner.y, L.topRightCorner.y, L.bottomLeftCorner.y, L.bottomRightCorner.y];
-    const x = Math.min(...xs), y = Math.min(...ys);
-    return { text: code.data, version: code.version, box: { x, y, w: Math.max(...xs) - x, h: Math.max(...ys) - y } };
-}
-
-// Ảnh xám (1 byte/pixel) -> RGBA mà jsQR / BarcodeDetector cần
-function grayToRGBA(gray, out) {
-    for (let i = 0, j = 0; i < gray.length; i++, j += 4) {
-        const v = gray[i];
-        out[j] = v; out[j + 1] = v; out[j + 2] = v; out[j + 3] = 255;
-    }
-    return out;
-}
+const JSQR_OPTS = { inversionAttempts: "dontInvert" };   // giống code gốc
 
 // ======================= MÃ CHO WEB WORKER =======================
+// Worker nhận nguyên ảnh RGBA cả khung hình (giống hệt dữ liệu code gốc đưa vào jsQR)
 const WORKER_SRC = `
 let ok = true;
 try { importScripts(${JSON.stringify(JSQR_URL)}); } catch (e) { ok = false; }
-const jsqrResult = ${jsqrResult.toString()};
-const grayToRGBA = ${grayToRGBA.toString()};
-let rgba = null;
 self.onmessage = (e) => {
-    const { buffer, width: w, height: h } = e.data;
-    let res = { text: null };
+    const { buffer, width, height } = e.data;
+    let text = null;
     try {
-        const gray = new Uint8Array(buffer);
-        if (!rgba || rgba.length !== gray.length * 4) rgba = new Uint8ClampedArray(gray.length * 4);
-        res = jsqrResult(jsQR(grayToRGBA(gray, rgba), w, h, { inversionAttempts: "dontInvert" }));
+        const code = jsQR(new Uint8ClampedArray(buffer), width, height, ${JSON.stringify(JSQR_OPTS)});
+        if (code) text = code.data;
     } catch (err) {}
-    res.bw = w; res.bh = h;
-    self.postMessage(res);
+    self.postMessage({ text });
 };
 self.postMessage({ ready: ok && typeof jsQR === "function" });
 `;
@@ -125,23 +88,18 @@ self.postMessage({ ready: ok && typeof jsQR === "function" });
 // ======================= BIẾN TOÀN CỤC =======================
 const $ = id => document.getElementById(id);
 const video = $("video");
-const grabCanvas = document.createElement("canvas");
-const grabCtx = grabCanvas.getContext("2d", { willReadFrequently: true });
-const thumbCanvas = document.createElement("canvas");
-thumbCanvas.width = thumbCanvas.height = CONFIG.thumbSize;
-const thumbCtx = thumbCanvas.getContext("2d", { willReadFrequently: true });
+const canvas = document.createElement("canvas");
+const ctx = canvas.getContext("2d", { willReadFrequently: true });
 
 let stream = null;
 let running = false;
 let isDownloading = false;
-let roi = { x: 0, y: 0, size: 0 };
 let vfcId = null, rafId = null, lastVideoTime = -1;
 
-// Bộ đệm frame (FIFO). Mỗi phần tử: { gray, meta, purged }
+// Bộ đệm frame (FIFO): mọi frame camera đều được lưu, giải mã dần
 let buffer = [];
 let head = 0;
 let bufferBytes = 0;
-let bufferCount = 0;
 let recordingPaused = false;
 const MAX_BYTES = CONFIG.maxBufferMB * 1024 * 1024;
 
@@ -150,12 +108,6 @@ let decoderMode = null;      // "native" | "worker" | "main"
 let detector = null;
 let workers = [];
 let nativeInFlight = 0;
-let mainRGBA = null;
-
-// Bám vị trí + chống trùng
-let track = null;
-let trackFails = 0;
-let lastSuccessThumb = null;
 
 // Dữ liệu file
 let currentSession = null;
@@ -169,7 +121,7 @@ let lastText = null;
 let renderPending = false;
 
 // Thống kê
-const stats = { captured: 0, stored: 0, skipped: 0, purged: 0, decoded: 0, found: 0, lostFull: 0 };
+const stats = { captured: 0, decoded: 0, found: 0, lostFull: 0 };
 let lastStats = null;
 let statsTimer = null;
 
@@ -197,15 +149,13 @@ async function initDecoders() {
         const url = URL.createObjectURL(new Blob([WORKER_SRC], { type: "text/javascript" }));
         const readyPromises = [];
         for (let i = 0; i < CONFIG.workers; i++) {
-            const slot = { w: new Worker(url), busy: false, meta: null };
+            const slot = { w: new Worker(url), busy: false };
             readyPromises.push(new Promise(resolve => {
                 const timer = setTimeout(() => resolve(false), 8000);
                 slot.w.onmessage = (e) => {
                     if ("ready" in e.data) { clearTimeout(timer); resolve(e.data.ready); return; }
-                    const meta = slot.meta;
                     slot.busy = false;
-                    slot.meta = null;
-                    if (meta) handleResult(meta, e.data);
+                    handleResult(e.data.text);
                     pump();
                 };
                 slot.w.onerror = () => { clearTimeout(timer); slot.busy = false; resolve(false); };
@@ -242,7 +192,8 @@ async function startCamera() {
     video.srcObject = stream;
     video.onloadedmetadata = async () => {
         try { await video.play(); } catch (e) {}
-        updateROI();
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
         isDownloading = false;
         running = true;
         lastVideoTime = -1;
@@ -252,7 +203,7 @@ async function startCamera() {
     };
 }
 
-// Tắt camera chỉ dừng GHI; các frame đã lưu trong bộ đệm vẫn tiếp tục được giải mã
+// Tắt camera chỉ dừng GHI; các frame đã lưu vẫn tiếp tục được giải mã
 function stopCamera() {
     running = false;
     if (vfcId !== null && video.cancelVideoFrameCallback) video.cancelVideoFrameCallback(vfcId);
@@ -260,39 +211,17 @@ function stopCamera() {
     vfcId = rafId = null;
     if (stream) stream.getTracks().forEach(t => t.stop());
     stream = null;
-    $("roi-box").style.display = "none";
-    $("track-box").style.display = "none";
-    setStatus(bufferCount ? `Đã tắt camera, đang xử lý nốt ${bufferCount} frame...` : "Đã tắt camera.", "#fff");
+    setStatus(bufferCount() ? `Đã tắt camera, đang xử lý nốt ${bufferCount()} frame...` : "Đã tắt camera.", "#fff");
 }
 
 function clearBuffer() {
-    buffer = []; head = 0; bufferBytes = 0; bufferCount = 0;
+    buffer = []; head = 0; bufferBytes = 0;
     recordingPaused = false;
     updateBufferBar();
 }
 
-function updateROI() {
-    const vw = video.videoWidth, vh = video.videoHeight;
-    if (!vw || !vh) return;
-    const size = Math.floor(Math.min(vw, vh) * CONFIG.roi);
-    roi = { x: Math.floor((vw - size) / 2), y: Math.floor((vh - size) / 2), size };
-    track = null;
-    lastSuccessThumb = null;
-    placeBox($("roi-box"), roi.x, roi.y, size, size);
-}
-video.addEventListener("resize", updateROI);
-
-function placeBox(el, x, y, w, h) {
-    const vw = video.videoWidth, vh = video.videoHeight;
-    if (!vw || !vh) return;
-    el.style.left = (x / vw * 100) + "%";
-    el.style.top = (y / vh * 100) + "%";
-    el.style.width = (w / vw * 100) + "%";
-    el.style.height = (h / vh * 100) + "%";
-    el.style.display = "block";
-}
-
 // ======================= GHI FRAME =======================
+// requestVideoFrameCallback: chạy đúng 1 lần cho mỗi frame mới của camera
 function scheduleNextFrame() {
     if (!running) return;
     if (video.requestVideoFrameCallback) {
@@ -308,177 +237,74 @@ function scheduleNextFrame() {
     }
 }
 
-function rgbaToGray(d, n) {
-    const g = new Uint8Array(n);
-    for (let i = 0, j = 0; i < n; i++, j += 4) g[i] = (d[j] * 77 + d[j + 1] * 150 + d[j + 2] * 29) >> 8;
-    return g;
-}
-
-function makeThumb() {
-    const T = CONFIG.thumbSize;
-    thumbCtx.drawImage(video, roi.x, roi.y, roi.size, roi.size, 0, 0, T, T);
-    return rgbaToGray(thumbCtx.getImageData(0, 0, T, T).data, T * T);
-}
-
-function thumbDiff(a, b) {
-    let s = 0;
-    for (let i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]);
-    return s / a.length;
-}
-
-function getCaptureRegion() {
-    const vw = video.videoWidth, vh = video.videoHeight;
-    if (track) {
-        const m = Math.max(track.w, track.h) * CONFIG.trackMargin;
-        const sx = Math.max(0, Math.floor(track.x - m));
-        const sy = Math.max(0, Math.floor(track.y - m));
-        const sw = Math.min(vw - sx, Math.ceil(track.w + 2 * m));
-        const sh = Math.min(vh - sy, Math.ceil(track.h + 2 * m));
-        const scale = track.module ? Math.min(1, CONFIG.targetModulePx / track.module) : 1;
-        return { sx, sy, sw, sh, dw: Math.max(1, Math.round(sw * scale)), dh: Math.max(1, Math.round(sh * scale)), tracked: true };
-    }
-    const s = roi.size;
-    const d = Math.min(s, CONFIG.searchMaxSize);
-    return { sx: roi.x, sy: roi.y, sw: s, sh: s, dw: d, dh: d, tracked: false };
-}
-
 function captureFrame() {
-    if (!running || isDownloading || video.readyState < 2 || !roi.size) return;
+    if (!running || isDownloading || video.readyState < 2) return;
+    // Camera xoay màn hình -> kích thước đổi
+    if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+    }
     stats.captured++;
 
-    // Bộ đệm đầy: tạm dừng ghi (frame này mất) cho tới khi bộ đệm còn 50%
     if (recordingPaused) {
         if (bufferBytes < MAX_BYTES / 2) recordingPaused = false;
         else { stats.lostFull++; return; }
     }
 
-    // Màn hình vẫn đang hiện đúng mã vừa đọc được -> không cần lưu
-    const thumb = makeThumb();
-    if (lastSuccessThumb && thumbDiff(thumb, lastSuccessThumb) < CONFIG.dupThreshold) {
-        stats.skipped++;
-        return;
-    }
+    // Chụp nguyên khung hình, y hệt code gốc
+    const w = canvas.width, h = canvas.height;
+    ctx.drawImage(video, 0, 0, w, h);
+    const img = ctx.getImageData(0, 0, w, h);
 
-    // Chụp vùng cần giải mã, chuyển sang ảnh xám 1 byte/pixel (nhẹ hơn RGBA 4 lần) rồi cất vào bộ đệm
-    const meta = getCaptureRegion();
-    meta.thumb = thumb;
-    if (grabCanvas.width !== meta.dw || grabCanvas.height !== meta.dh) {
-        grabCanvas.width = meta.dw;
-        grabCanvas.height = meta.dh;
-    }
-    grabCtx.drawImage(video, meta.sx, meta.sy, meta.sw, meta.sh, 0, 0, meta.dw, meta.dh);
-    const gray = rgbaToGray(grabCtx.getImageData(0, 0, meta.dw, meta.dh).data, meta.dw * meta.dh);
-
-    buffer.push({ gray, meta, purged: false });
-    bufferBytes += gray.length + thumb.length;
-    bufferCount++;
-    stats.stored++;
+    buffer.push({ data: img.data, w, h });
+    bufferBytes += img.data.byteLength;
     if (bufferBytes >= MAX_BYTES) recordingPaused = true;
     pump();
 }
 
-// ======================= LẤY FRAME TỪ BỘ ĐỆM ĐI GIẢI MÃ =======================
+function bufferCount() { return buffer.length - head; }
+
 function takeFromBuffer() {
-    while (head < buffer.length) {
-        const item = buffer[head];
-        buffer[head++] = undefined;
-        if (head > 1024 && head * 2 > buffer.length) { buffer = buffer.slice(head); head = 0; }
-        if (item.purged) continue;            // đã bị dọn vì trùng (đã trừ bộ nhớ lúc dọn)
-        bufferBytes -= item.gray.length + item.meta.thumb.length;
-        bufferCount--;
-        return item;
-    }
-    return null;
+    if (head >= buffer.length) return null;
+    const item = buffer[head];
+    buffer[head++] = undefined;
+    if (head > 1024 && head * 2 > buffer.length) { buffer = buffer.slice(head); head = 0; }
+    bufferBytes -= item.data.byteLength;
+    return item;
 }
 
-function hasBuffered() { return bufferCount > 0; }
-
+// ======================= GIẢI MÃ DẦN TỪ BỘ ĐỆM =======================
 function pump() {
-    while (hasBuffered() && !isDownloading) {
+    while (bufferCount() > 0 && !isDownloading) {
         if (decoderMode === "native") {
             if (nativeInFlight >= CONFIG.nativeConcurrency) return;
             const item = takeFromBuffer();
-            if (!item) return;
-            const { dw: w, dh: h } = item.meta;
-            const img = new ImageData(grayToRGBA(item.gray, new Uint8ClampedArray(w * h * 4)), w, h);
             nativeInFlight++;
-            detector.detect(img)
-                .then(codes => {
-                    const c = codes[0];
-                    handleResult(item.meta, c
-                        ? { text: c.rawValue, bw: w, bh: h, box: { x: c.boundingBox.x, y: c.boundingBox.y, w: c.boundingBox.width, h: c.boundingBox.height } }
-                        : { text: null });
-                })
-                .catch(() => handleResult(item.meta, { text: null }))
+            detector.detect(new ImageData(item.data, item.w, item.h))
+                .then(codes => handleResult(codes.length ? codes[0].rawValue : null))
+                .catch(() => handleResult(null))
                 .finally(() => { nativeInFlight--; pump(); });
         } else if (decoderMode === "worker") {
             const slot = workers.find(s => !s.busy);
             if (!slot) return;
             const item = takeFromBuffer();
-            if (!item) return;
             slot.busy = true;
-            slot.meta = item.meta;
-            slot.w.postMessage({ buffer: item.gray.buffer, width: item.meta.dw, height: item.meta.dh }, [item.gray.buffer]);
+            slot.w.postMessage({ buffer: item.data.buffer, width: item.w, height: item.h }, [item.data.buffer]);
         } else {
             const item = takeFromBuffer();
-            if (!item) return;
-            const { dw: w, dh: h } = item.meta;
-            if (!mainRGBA || mainRGBA.length !== w * h * 4) mainRGBA = new Uint8ClampedArray(w * h * 4);
-            const res = jsqrResult(jsQR(grayToRGBA(item.gray, mainRGBA), w, h, JSQR_OPTS));
-            res.bw = w; res.bh = h;
-            handleResult(item.meta, res);
-            if (hasBuffered()) setTimeout(pump, 0);
+            const code = jsQR(item.data, item.w, item.h, JSQR_OPTS);
+            handleResult(code ? code.data : null);
+            if (bufferCount() > 0) setTimeout(pump, 0);
             return;
         }
     }
 }
 
-// Đọc được 1 mã -> dọn các frame kế tiếp trong bộ đệm có cùng hình ảnh (cùng mã, khỏi giải mã lại)
-function purgeDuplicates(thumb) {
-    let checked = 0;
-    for (let i = head; i < buffer.length && checked < CONFIG.purgeWindow; i++) {
-        const it = buffer[i];
-        if (!it || it.purged) continue;
-        checked++;
-        if (thumbDiff(it.meta.thumb, thumb) < CONFIG.dupThreshold) {
-            it.purged = true;
-            bufferBytes -= it.gray.length + it.meta.thumb.length;
-            bufferCount--;
-            it.gray = null;
-            stats.purged++;
-        }
-    }
-}
-
-function handleResult(meta, res) {
+function handleResult(text) {
     stats.decoded++;
-    if (res.text) {
-        stats.found++;
-        lastSuccessThumb = meta.thumb;
-        trackFails = 0;
-        purgeDuplicates(meta.thumb);
-        if (res.box && res.bw) {
-            const kx = meta.sw / res.bw, ky = meta.sh / res.bh;
-            const x = meta.sx + res.box.x * kx, y = meta.sy + res.box.y * ky;
-            const w = res.box.w * kx, h = res.box.h * ky;
-            const modules = res.version ? 17 + 4 * res.version : null;
-            const module = modules ? Math.min(w, h) / modules : (track ? track.module : null);
-            track = { x, y, w, h, module };
-            if (running) placeBox($("track-box"), x, y, w, h);
-        }
-        onText(res.text);
-    } else if (meta.tracked && track) {
-        if (++trackFails >= CONFIG.trackMaxFails) {
-            track = null;
-            trackFails = 0;
-        }
-    }
-    if (!track) $("track-box").style.display = "none";
-}
-
-// ======================= XỬ LÝ DỮ LIỆU QR =======================
-function onText(text) {
-    if (text === lastText) return;
+    if (!text) return;
+    stats.found++;
+    if (text === lastText) return;   // cùng mã ở nhiều frame liên tiếp: bỏ qua, không parse lại
     lastText = text;
     let p;
     try { p = JSON.parse(text); } catch (e) { return; }
@@ -486,6 +312,7 @@ function onText(text) {
     handleValidPayload(p);
 }
 
+// ======================= XỬ LÝ DỮ LIỆU QR =======================
 function handleValidPayload(payload) {
     if (payload.i === completedSession || isDownloading) return;
 
@@ -565,7 +392,7 @@ function updateBufferBar() {
 }
 
 function startStats() {
-    if (statsTimer) return;   // chạy suốt, kể cả khi đã tắt camera mà bộ đệm còn frame
+    if (statsTimer) return;
     lastStats = { ...stats, t: performance.now() };
     statsTimer = setInterval(() => {
         const now = performance.now();
@@ -574,14 +401,13 @@ function startStats() {
         const tr = stream && stream.getVideoTracks()[0];
         const s = tr && tr.getSettings ? tr.getSettings() : {};
         const modeName = decoderMode === "native" ? "Native" : decoderMode === "worker" ? `jsQR x${workers.length} luồng` : "jsQR luồng chính";
-        const mb = (bufferBytes / 1048576).toFixed(1);
-        const line1 = `${s.width || "-"}x${s.height || "-"}@${s.frameRate ? Math.round(s.frameRate) : "-"} | ${modeName} | Bám: ${track ? "có" : "không"}`;
-        const line2 = `Bắt ${rate("captured")} | Lưu ${rate("stored")} | Trùng ${rate("skipped")}+${rate("purged")} | Giải mã ${rate("decoded")} | Đọc được ${rate("found")} /s`;
-        const line3 = `Bộ đệm: ${bufferCount} frame (${mb} MB)${recordingPaused ? " - ĐẦY, TẠM DỪNG GHI" : ""} | Mất do đầy: ${stats.lostFull}`;
+        const line1 = `${s.width || "-"}x${s.height || "-"}@${s.frameRate ? Math.round(s.frameRate) : "-"} | ${modeName}`;
+        const line2 = `Bắt ${rate("captured")} | Giải mã ${rate("decoded")} | Có mã ${rate("found")} frame/s`;
+        const line3 = `Bộ đệm: ${bufferCount()} frame (${(bufferBytes / 1048576).toFixed(0)} MB)${recordingPaused ? " - ĐẦY, TẠM DỪNG GHI" : ""} | Mất do đầy: ${stats.lostFull}`;
         $("stats").innerText = `${line1}\n${line2}\n${line3}`;
         updateBufferBar();
         if (!running && !isDownloading && totalFrames && receivedCount < totalFrames) {
-            setStatus(bufferCount ? `Đã tắt camera, đang xử lý nốt ${bufferCount} frame...` : "Đã tắt camera.", "#fff");
+            setStatus(bufferCount() ? `Đã tắt camera, đang xử lý nốt ${bufferCount()} frame...` : "Đã tắt camera.", "#fff");
         }
         lastStats = { ...stats, t: now };
     }, 1000);
