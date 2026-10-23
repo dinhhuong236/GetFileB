@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>QR Chuẩn - Receiver</title>
-<!-- jsQR dùng làm phương án dự phòng trên luồng chính nếu Worker không khởi tạo được -->
+<title>QR Chuẩn - Receiver (15 fps)</title>
+<!-- jsQR: dự phòng cuối cùng trên luồng chính nếu không tạo được Worker -->
 <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
 <style>
     body { font-family: Arial, sans-serif; text-align: center; background: #222; color: white; margin: 0; padding: 15px; }
@@ -12,12 +12,14 @@
     .btn-stop { background: #dc3545; }
     .btn-gray { background: #666; }
 
-    #video-container { position: relative; display: inline-block; margin-top: 10px; width: 100%; max-width: 400px; }
-    video { width: 100%; height: auto; border: 2px solid #555; border-radius: 8px; background: #000; }
+    #video-container { position: relative; display: inline-block; margin-top: 10px; width: 100%; max-width: 400px; overflow: hidden; border: 2px solid #555; border-radius: 8px; }
+    video { display: block; width: 100%; height: auto; background: #000; }
 
-    #scan-overlay {
-        position: absolute; top: 0; left: 0; width: 100%; height: 100%;
-        box-shadow: inset 0 0 0 40px rgba(0,0,0,0.5); pointer-events: none;
+    /* Khung vùng quét (ROI): chỉ phần trong khung được giải mã */
+    #roi-box {
+        position: absolute; left: 5%; top: 5%; width: 90%; height: 90%;
+        border: 2px solid #00ff00; border-radius: 4px; pointer-events: none;
+        box-shadow: 0 0 0 9999px rgba(0,0,0,0.45);
     }
 
     #progress-container { width: 90%; max-width: 400px; background: #444; margin: 15px auto; height: 25px; border-radius: 12px; overflow: hidden; border: 1px solid #666; }
@@ -44,45 +46,80 @@
     <div id="progress-bar"></div>
 </div>
 <div id="progress-text">0 / 0 mã QR</div>
-<div id="missing-frames">Đưa camera về phía màn hình phát...</div>
+<div id="missing-frames">Đưa mã QR vào trong khung xanh...</div>
 <!-- Thanh xanh dương: mức dùng bộ đệm frame -->
 <div id="buffer-container"><div id="buffer-bar"></div></div>
 <div id="stats"></div>
 
 <div id="video-container">
     <video id="video" autoplay playsinline muted></video>
-    <div id="scan-overlay"></div>
+    <div id="roi-box"></div>
 </div>
 
 <script>
 // ======================= CẤU HÌNH =======================
 const CONFIG = {
-    camWidth: 640,           // giữ như code gốc; có thể thử 1280x720 nếu QR rất dày
-    camHeight: 480,
-    camFps: 30,              // có thể thử 60 nếu máy hỗ trợ
-    maxBufferMB: 256,        // giới hạn bộ nhớ cho bộ đệm; đầy thì tạm dừng ghi tới khi còn 50%
+    // Camera: độ phân giải cao hơn -> mỗi ô QR nhiều pixel hơn -> đọc được cả khi hơi mờ.
+    // 60 fps -> mỗi mã QR (hiển thị 66 ms ở 15 fps) có ~4 frame thay vì 2, ít bị mất do frame chuyển cảnh.
+    camWidth: 1280,
+    camHeight: 720,
+    camFps: 60,
+
+    // Chỉ giải mã vùng vuông ở giữa (tỉ lệ theo cạnh ngắn), bớt ~50% pixel cần xử lý
+    roiScale: 0.9,
+    maxDecodeSide: 720,      // vùng quét lớn hơn mức này thì thu nhỏ lại trước khi giải mã
+
+    // Bỏ qua frame giống hệt frame vừa đọc được mã (cùng 1 QR) -> giảm 50-75% việc giải mã
+    skipDuplicates: true,
+    dupThreshold: 0.04,      // tỉ lệ điểm mẫu khác nhau tối đa để coi là "cùng một QR"
+
+    maxBufferMB: 192,        // đầy thì tạm dừng ghi tới khi còn 50%
     workers: Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 2) - 1)),
     nativeConcurrency: 2,
-    useNative: true          // false = luôn dùng jsQR (để so sánh chất lượng nhận dạng)
+
+    // "auto": zxing-wasm (nhanh nhất) -> BarcodeDetector -> jsQR; hoặc ép "zxing" | "native" | "jsqr"
+    decoder: "auto"
 };
 const JSQR_URL = "https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js";
-const JSQR_OPTS = { inversionAttempts: "dontInvert" };   // giống code gốc
+const ZXING_URL = "https://cdn.jsdelivr.net/npm/zxing-wasm@3.1.3/dist/iife/reader/index.js";
+const JSQR_OPTS = { inversionAttempts: "dontInvert" };
 
 // ======================= MÃ CHO WEB WORKER =======================
-// Worker nhận nguyên ảnh RGBA cả khung hình (giống hệt dữ liệu code gốc đưa vào jsQR)
+// Một worker dùng chung cho 2 bộ giải mã: zxing-wasm (C++ biên dịch WebAssembly, nhanh hơn jsQR nhiều lần) hoặc jsQR
 const WORKER_SRC = `
-let ok = true;
-try { importScripts(${JSON.stringify(JSQR_URL)}); } catch (e) { ok = false; }
-self.onmessage = (e) => {
-    const { buffer, width, height } = e.data;
+let engine = null;
+const ZX_OPTS = { formats: ["QRCode"], maxNumberOfSymbols: 1 };
+async function init(kind, urls) {
+    try {
+        if (kind === "zxing") {
+            importScripts(urls.zxing);
+            // Gọi thử 1 lần để chắc chắn file .wasm đã tải và chạy được
+            await ZXingWASM.readBarcodes(new ImageData(16, 16), ZX_OPTS);
+        } else {
+            importScripts(urls.jsqr);
+            if (typeof jsQR !== "function") return false;
+        }
+        engine = kind;
+        return true;
+    } catch (e) { return false; }
+}
+self.onmessage = async (e) => {
+    const m = e.data;
+    if (m.type === "init") { self.postMessage({ type: "ready", ok: await init(m.kind, m.urls) }); return; }
     let text = null;
     try {
-        const code = jsQR(new Uint8ClampedArray(buffer), width, height, ${JSON.stringify(JSQR_OPTS)});
-        if (code) text = code.data;
+        const data = new Uint8ClampedArray(m.buffer);
+        if (engine === "zxing") {
+            const res = await ZXingWASM.readBarcodes(new ImageData(data, m.width, m.height), ZX_OPTS);
+            const r = res && res[0];
+            if (r && r.isValid !== false && r.text) text = r.text;
+        } else {
+            const code = jsQR(data, m.width, m.height, ${JSON.stringify(JSQR_OPTS)});
+            if (code) text = code.data;
+        }
     } catch (err) {}
-    self.postMessage({ text });
+    self.postMessage({ type: "result", text, sig: m.sig }, m.sig ? [m.sig.buffer] : []);
 };
-self.postMessage({ ready: ok && typeof jsQR === "function" });
 `;
 
 // ======================= BIẾN TOÀN CỤC =======================
@@ -96,6 +133,9 @@ let running = false;
 let isDownloading = false;
 let vfcId = null, rafId = null, lastVideoTime = -1;
 
+// Vùng quét
+let roi = { vw: 0, vh: 0, sx: 0, sy: 0, ss: 0, ds: 0 };
+
 // Bộ đệm frame (FIFO): mọi frame camera đều được lưu, giải mã dần
 let buffer = [];
 let head = 0;
@@ -103,11 +143,16 @@ let bufferBytes = 0;
 let recordingPaused = false;
 const MAX_BYTES = CONFIG.maxBufferMB * 1024 * 1024;
 
+// Chống giải mã trùng
+const SIG_N = 48;            // lưới 48x48 điểm mẫu
+let lastOkSig = null;        // "dấu vân tay" của frame gần nhất đọc được mã
+
 // Bộ giải mã
-let decoderMode = null;      // "native" | "worker" | "main"
+let decoderMode = null;      // "zxing" | "native" | "worker" | "main"
 let detector = null;
 let workers = [];
 let nativeInFlight = 0;
+let workerUrl = null;
 
 // Dữ liệu file
 let currentSession = null;
@@ -121,7 +166,7 @@ let lastText = null;
 let renderPending = false;
 
 // Thống kê
-const stats = { captured: 0, decoded: 0, found: 0, lostFull: 0 };
+const stats = { captured: 0, skipped: 0, decoded: 0, found: 0, lostFull: 0 };
 let lastStats = null;
 let statsTimer = null;
 
@@ -131,42 +176,53 @@ function setStatus(msg, color = "#ffcc00") {
 }
 
 // ======================= KHỞI TẠO BỘ GIẢI MÃ =======================
+function spawnWorker(kind) {
+    if (!workerUrl) workerUrl = URL.createObjectURL(new Blob([WORKER_SRC], { type: "text/javascript" }));
+    const slot = { w: new Worker(workerUrl), busy: false };
+    const ready = new Promise(resolve => {
+        const timer = setTimeout(() => resolve(false), kind === "zxing" ? 15000 : 8000);
+        slot.w.onmessage = (e) => {
+            const m = e.data;
+            if (m.type === "ready") { clearTimeout(timer); resolve(m.ok); return; }
+            slot.busy = false;
+            handleResult(m.text, m.sig);
+            pump();
+        };
+        slot.w.onerror = () => { clearTimeout(timer); slot.busy = false; resolve(false); };
+    });
+    slot.w.postMessage({ type: "init", kind, urls: { zxing: ZXING_URL, jsqr: JSQR_URL } });
+    return ready.then(ok => { if (ok) return slot; slot.w.terminate(); return null; });
+}
+
+async function initWorkerPool(kind) {
+    try {
+        // Tạo 1 worker trước (tải thư viện 1 lần vào cache), được thì tạo nốt
+        const first = await spawnWorker(kind);
+        if (!first) return false;
+        const rest = await Promise.all(Array.from({ length: CONFIG.workers - 1 }, () => spawnWorker(kind)));
+        workers = [first, ...rest.filter(Boolean)];
+        return true;
+    } catch (e) { return false; }
+}
+
+async function initNative() {
+    if (!("BarcodeDetector" in window)) return false;
+    try {
+        const fmts = await BarcodeDetector.getSupportedFormats();
+        if (!fmts.includes("qr_code")) return false;
+        detector = new BarcodeDetector({ formats: ["qr_code"] });
+        return true;
+    } catch (e) { return false; }
+}
+
 async function initDecoders() {
     if (decoderMode) return;
-
-    if (CONFIG.useNative && "BarcodeDetector" in window) {
-        try {
-            const fmts = await BarcodeDetector.getSupportedFormats();
-            if (fmts.includes("qr_code")) {
-                detector = new BarcodeDetector({ formats: ["qr_code"] });
-                decoderMode = "native";
-                return;
-            }
-        } catch (e) {}
+    const order = CONFIG.decoder === "auto" ? ["zxing", "native", "jsqr"] : [CONFIG.decoder, "jsqr"];
+    for (const kind of order) {
+        setStatus(`Đang tải bộ giải mã (${kind})...`);
+        if (kind === "native") { if (await initNative()) { decoderMode = "native"; return; } }
+        else if (await initWorkerPool(kind)) { decoderMode = kind === "zxing" ? "zxing" : "worker"; return; }
     }
-
-    try {
-        const url = URL.createObjectURL(new Blob([WORKER_SRC], { type: "text/javascript" }));
-        const readyPromises = [];
-        for (let i = 0; i < CONFIG.workers; i++) {
-            const slot = { w: new Worker(url), busy: false };
-            readyPromises.push(new Promise(resolve => {
-                const timer = setTimeout(() => resolve(false), 8000);
-                slot.w.onmessage = (e) => {
-                    if ("ready" in e.data) { clearTimeout(timer); resolve(e.data.ready); return; }
-                    slot.busy = false;
-                    handleResult(e.data.text);
-                    pump();
-                };
-                slot.w.onerror = () => { clearTimeout(timer); slot.busy = false; resolve(false); };
-            }));
-            workers.push(slot);
-        }
-        const results = await Promise.all(readyPromises);
-        workers = workers.filter((s, i) => results[i]);
-        if (workers.length > 0) { decoderMode = "worker"; return; }
-    } catch (e) {}
-
     decoderMode = "main";
 }
 
@@ -189,11 +245,19 @@ async function startCamera() {
         setStatus("Lỗi Camera! Hãy mở qua link HTTPS.", "#ff5555");
         return;
     }
+    // Lấy nét liên tục nếu máy hỗ trợ (bỏ qua nếu không)
+    try {
+        const track = stream.getVideoTracks()[0];
+        const caps = track.getCapabilities ? track.getCapabilities() : {};
+        if (caps.focusMode && caps.focusMode.includes("continuous")) {
+            await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
+        }
+    } catch (e) {}
+
     video.srcObject = stream;
     video.onloadedmetadata = async () => {
         try { await video.play(); } catch (e) {}
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
+        updateRoi();
         isDownloading = false;
         running = true;
         lastVideoTime = -1;
@@ -220,6 +284,22 @@ function clearBuffer() {
     updateBufferBar();
 }
 
+// Tính vùng quét vuông ở giữa khung hình + vẽ khung xanh tương ứng
+function updateRoi() {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw || !vh) return;
+    const ss = Math.round(Math.min(vw, vh) * CONFIG.roiScale);
+    const ds = Math.min(ss, CONFIG.maxDecodeSide);
+    roi = { vw, vh, ss, ds, sx: Math.round((vw - ss) / 2), sy: Math.round((vh - ss) / 2) };
+    canvas.width = ds;
+    canvas.height = ds;
+    const box = $("roi-box").style;
+    box.left = (roi.sx / vw * 100) + "%";
+    box.top = (roi.sy / vh * 100) + "%";
+    box.width = (ss / vw * 100) + "%";
+    box.height = (ss / vh * 100) + "%";
+}
+
 // ======================= GHI FRAME =======================
 // requestVideoFrameCallback: chạy đúng 1 lần cho mỗi frame mới của camera
 function scheduleNextFrame() {
@@ -240,10 +320,7 @@ function scheduleNextFrame() {
 function captureFrame() {
     if (!running || isDownloading || video.readyState < 2) return;
     // Camera xoay màn hình -> kích thước đổi
-    if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-    }
+    if (roi.vw !== video.videoWidth || roi.vh !== video.videoHeight) updateRoi();
     stats.captured++;
 
     if (recordingPaused) {
@@ -251,15 +328,58 @@ function captureFrame() {
         else { stats.lostFull++; return; }
     }
 
-    // Chụp nguyên khung hình, y hệt code gốc
-    const w = canvas.width, h = canvas.height;
-    ctx.drawImage(video, 0, 0, w, h);
-    const img = ctx.getImageData(0, 0, w, h);
+    // Chỉ cắt vùng quét ở giữa
+    const ds = roi.ds;
+    ctx.drawImage(video, roi.sx, roi.sy, roi.ss, roi.ss, 0, 0, ds, ds);
+    const img = ctx.getImageData(0, 0, ds, ds);
+    const sig = CONFIG.skipDuplicates ? signature(img.data, ds) : null;
 
-    buffer.push({ data: img.data, w, h });
+    buffer.push({ data: img.data, w: ds, h: ds, sig });
     bufferBytes += img.data.byteLength;
     if (bufferBytes >= MAX_BYTES) recordingPaused = true;
     pump();
+}
+
+// "Dấu vân tay" frame: lưới SIG_N x SIG_N điểm (kênh xanh lá).
+// Mỗi điểm lưu [giá trị, min, max của 3x3 pixel quanh nó] -> chịu được rung tay lệch ±1 px.
+// Bố cục mảng: [v (n) | lo (n) | hi (n)]
+function signature(d, s) {
+    const n = SIG_N * SIG_N;
+    const sig = new Uint8Array(n * 3);
+    const step = s / SIG_N;
+    for (let y = 0; y < SIG_N; y++) {
+        const cy = Math.floor((y + 0.5) * step);
+        for (let x = 0; x < SIG_N; x++) {
+            const cx = Math.floor((x + 0.5) * step);
+            let lo = 255, hi = 0;
+            for (let dy = -1; dy <= 1; dy++) {
+                const row = (cy + dy) * s;
+                for (let dx = -1; dx <= 1; dx++) {
+                    const q = d[(row + cx + dx) * 4 + 1];
+                    if (q < lo) lo = q;
+                    if (q > hi) hi = q;
+                }
+            }
+            const i = y * SIG_N + x;
+            sig[i] = d[(cy * s + cx) * 4 + 1];
+            sig[n + i] = lo;
+            sig[2 * n + i] = hi;
+        }
+    }
+    return sig;
+}
+
+// Cùng 1 mã QR nếu rất ít điểm mẫu nằm ngoài khoảng [min, max] của frame tham chiếu
+function sameAsLastOk(sig) {
+    if (!sig || !lastOkSig) return false;
+    const n = SIG_N * SIG_N, T = 48;
+    const limit = n * CONFIG.dupThreshold;
+    let diff = 0;
+    for (let i = 0; i < n; i++) {
+        const v = sig[i];
+        if ((v < lastOkSig[n + i] - T || v > lastOkSig[2 * n + i] + T) && ++diff > limit) return false;
+    }
+    return true;
 }
 
 function bufferCount() { return buffer.length - head; }
@@ -273,37 +393,57 @@ function takeFromBuffer() {
     return item;
 }
 
+// Lấy frame kế tiếp cần giải mã, bỏ qua các frame trùng với QR vừa đọc được
+function nextItem() {
+    let item;
+    while ((item = takeFromBuffer())) {
+        if (sameAsLastOk(item.sig)) {
+            stats.skipped++;
+            lastOkSig = item.sig;   // so theo chuỗi frame liền kề -> không bị trôi khi tay rung dần
+            continue;
+        }
+        return item;
+    }
+    return null;
+}
+
 // ======================= GIẢI MÃ DẦN TỪ BỘ ĐỆM =======================
 function pump() {
     while (bufferCount() > 0 && !isDownloading) {
         if (decoderMode === "native") {
             if (nativeInFlight >= CONFIG.nativeConcurrency) return;
-            const item = takeFromBuffer();
+            const item = nextItem();
+            if (!item) return;
             nativeInFlight++;
             detector.detect(new ImageData(item.data, item.w, item.h))
-                .then(codes => handleResult(codes.length ? codes[0].rawValue : null))
+                .then(codes => handleResult(codes.length ? codes[0].rawValue : null, item.sig))
                 .catch(() => handleResult(null))
                 .finally(() => { nativeInFlight--; pump(); });
-        } else if (decoderMode === "worker") {
+        } else if (decoderMode === "zxing" || decoderMode === "worker") {
             const slot = workers.find(s => !s.busy);
             if (!slot) return;
-            const item = takeFromBuffer();
+            const item = nextItem();
+            if (!item) return;
             slot.busy = true;
-            slot.w.postMessage({ buffer: item.data.buffer, width: item.w, height: item.h }, [item.data.buffer]);
+            const transfer = [item.data.buffer];
+            if (item.sig) transfer.push(item.sig.buffer);
+            slot.w.postMessage({ buffer: item.data.buffer, width: item.w, height: item.h, sig: item.sig }, transfer);
         } else {
-            const item = takeFromBuffer();
+            const item = nextItem();
+            if (!item) return;
             const code = jsQR(item.data, item.w, item.h, JSQR_OPTS);
-            handleResult(code ? code.data : null);
+            handleResult(code ? code.data : null, item.sig);
             if (bufferCount() > 0) setTimeout(pump, 0);
             return;
         }
     }
 }
 
-function handleResult(text) {
+function handleResult(text, sig) {
     stats.decoded++;
     if (!text) return;
     stats.found++;
+    if (sig) lastOkSig = sig;
     if (text === lastText) return;   // cùng mã ở nhiều frame liên tiếp: bỏ qua, không parse lại
     lastText = text;
     let p;
@@ -400,9 +540,14 @@ function startStats() {
         const rate = k => ((stats[k] - lastStats[k]) / dt).toFixed(0);
         const tr = stream && stream.getVideoTracks()[0];
         const s = tr && tr.getSettings ? tr.getSettings() : {};
-        const modeName = decoderMode === "native" ? "Native" : decoderMode === "worker" ? `jsQR x${workers.length} luồng` : "jsQR luồng chính";
-        const line1 = `${s.width || "-"}x${s.height || "-"}@${s.frameRate ? Math.round(s.frameRate) : "-"} | ${modeName}`;
-        const line2 = `Bắt ${rate("captured")} | Giải mã ${rate("decoded")} | Có mã ${rate("found")} frame/s`;
+        const modeName = {
+            zxing: `zxing-wasm x${workers.length} luồng`,
+            native: "Native",
+            worker: `jsQR x${workers.length} luồng`,
+            main: "jsQR luồng chính"
+        }[decoderMode] || "-";
+        const line1 = `${s.width || "-"}x${s.height || "-"}@${s.frameRate ? Math.round(s.frameRate) : "-"} | vùng quét ${roi.ds}px | ${modeName}`;
+        const line2 = `Bắt ${rate("captured")} | Bỏ trùng ${rate("skipped")} | Giải mã ${rate("decoded")} | Có mã ${rate("found")} frame/s`;
         const line3 = `Bộ đệm: ${bufferCount()} frame (${(bufferBytes / 1048576).toFixed(0)} MB)${recordingPaused ? " - ĐẦY, TẠM DỪNG GHI" : ""} | Mất do đầy: ${stats.lostFull}`;
         $("stats").innerText = `${line1}\n${line2}\n${line3}`;
         updateBufferBar();
